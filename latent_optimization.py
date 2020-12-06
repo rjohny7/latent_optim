@@ -10,23 +10,46 @@ import torch.nn.functional as F
 import lpips
 
 class LatentOptim:
-    def __init__(self, generator, z_size, lr, device, target_image, logProbWeight=0, loss_type="default"):
+    def __init__(self, generator, z_size, lr, device, target_image, logProbWeight=0.0, shiftLossWeight=1.0, loss_type="default"):
+        self.logProbWeight = logProbWeight
+        self.loss_type = loss_type
         self.generator = generator
         self.z_size = z_size
         self.z_pdf = torch.distributions.Normal(0, 1)
 
+        # Latent Vector to optimize over
         self.z_vec = torch.randn(1, z_size, 1, 1, device=device).clone().detach()
         self.z_vec.requires_grad = True
 
+        # Affine transformation variables to optimize over
+        self.dy = torch.tensor(0.0).clone().detach()  # Shift image in y direction. (+) -> down, (-) -> up, range [-1, 1]
+        self.dy.requires_grad = True
+        self.dx = torch.tensor(0.0).clone().detach()  # Shift image in x direction. (+) -> right, (-) -> left, range [-1, 1]
+        self.dx.requires_grad = True
+        self.scale = torch.tensor(0.0).clone().detach()  # Zoom in or out. (+) -> zoom in, (-) -> zoom out, range [-1, 1]
+        self.scale.requires_grad = True
+        self.rot = torch.tensor(0.0).clone().detach()  # Rotate image. (+) -> Clockwise, (-) -> Counterclockwise
+        self.rot.requires_grad = True
+        self.shiftLossWeight = shiftLossWeight
+
+        # Define optimizer and params to optimize over
         self.params = [self.z_vec]
-        self.optim = torch.optim.Adam(self.params, lr=lr, betas=(0.9, 0.999))
+
+        # Add affine parameters if affine loss is specified
+        if "affine" in self.loss_type:
+            self.params.extend([self.dx, self.dy])
+
+            if "scale" in self.loss_type:
+                self.params.extend([self.scale])
+
+            if "rot" in self.loss_type:
+                self.params.extend([self.rot])
+
+        self.optim = torch.optim.Adam(self.params, lr=lr, betas=(0.9, 0.99))
         #self.optim = torch.optim.SGD(self.params, lr=lr, momentum=0.9)
         #self.scheduler = CosineAnnealingWarmRestarts(self.optim, 100, 1)
         #self.scheduler = CyclicLR(self.optim, base_lr=1e-2, max_lr=0.1, step_size_up=500)
         self.target_image = target_image
-
-        self.logProbWeight = logProbWeight
-        self.loss_type = loss_type
 
         # Gradient Convolution Kernels
         self.kernel_x = torch.FloatTensor([[-1, 0, 1],
@@ -77,16 +100,69 @@ class LatentOptim:
             edge_lpips = self.lpips_loss(self.get_grads(self.target_image)[0], self.get_grads(image)[0])
             lpips_loss = self.lpips_loss(self.target_image, image)
             loss = edge_lpips + lpips_loss
+        elif self.loss_type == 'affine_debug':
+            loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2)  # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
+        elif self.loss_type == 'affine(trans)_lpips':
+            theta = torch.zeros(1, 2, 3)
+            theta[:, 0, 0] = 1
+            theta[:, 0, 1] = 0
+            theta[:, 0, 2] = -self.dx * 2
+            theta[:, 1, 0] = 0
+            theta[:, 1, 1] = 1
+            theta[:, 1, 2] = -self.dy * 2
+            theta = theta.to(device)
+
+            grid = F.affine_grid(theta, image.shape, align_corners=False)
+            affined_target = F.grid_sample((-self.target_image+1)/2, grid, align_corners=False) * -2 + 1
+            lpips_loss = self.lpips_loss(affined_target, image)
+            shift_loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2)  # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
+            loss = lpips_loss + self.shiftLossWeight * shift_loss
+        elif self.loss_type == 'affine(trans/scale)_lpips':
+            theta = torch.zeros(1, 2, 3)
+            theta[:, 0, 0] = 1 + (-self.scale * 2)
+            theta[:, 0, 1] = 0
+            theta[:, 0, 2] = -self.dx * 2
+            theta[:, 1, 0] = 0
+            theta[:, 1, 1] = 1 + (-self.scale * 2)
+            theta[:, 1, 2] = -self.dy * 2
+            theta = theta.to(device)
+
+            grid = F.affine_grid(theta, image.shape, align_corners=False)
+            affined_target = F.grid_sample((-self.target_image + 1) / 2, grid, align_corners=False) * -2 + 1
+            lpips_loss = self.lpips_loss(affined_target, image)
+
+            # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
+            shift_loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2) + torch.pow(self.scale, 2)
+
+            loss = lpips_loss + self.shiftLossWeight * shift_loss
+        elif self.loss_type == 'affine(trans/scale/rot)_lpips':
+            theta = torch.zeros(1, 2, 3)
+            theta[:, 0, 0] = 1 + (-self.scale * 2)
+            theta[:, 0, 1] = self.rot * 2
+            theta[:, 0, 2] = -self.dx * 2
+            theta[:, 1, 0] = -self.rot * 2
+            theta[:, 1, 1] = 1 + (-self.scale * 2)
+            theta[:, 1, 2] = -self.dy * 2
+            theta = theta.to(device)
+
+            grid = F.affine_grid(theta, image.shape, align_corners=False)
+            affined_target = F.grid_sample((-self.target_image + 1) / 2, grid, align_corners=False) * -2 + 1
+            lpips_loss = self.lpips_loss(affined_target, image)
+
+            # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
+            shift_loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2) + torch.pow(self.scale, 2) + torch.pow(self.rot, 2)
+
+            loss = lpips_loss + self.shiftLossWeight * shift_loss
         else:
             assert False, "Invalid loss type"
 
-        print(f"Loss: {loss}")
+        print(f"Loss: {loss}, dx: {self.dx}, dy: {self.dy}, scale: {self.scale}")
 
         loss.backward()
         self.optim.step()
         #self.scheduler.step()
 
-        return loss.item()
+        return loss.item(), self.z_vec.detach()
 
 def biggest_rectangle(r):
     #return w*h
@@ -126,8 +202,7 @@ def cropFace(image_path, crop_size=(256, 256), resize_dims=(64, 64)):
 
     resized_image = Image.fromarray(resized_image).resize(resize_dims)
 
-    image_tensor = torch.from_numpy(np.array(resized_image)).permute(2, 0, 1).unsqueeze(
-        0).float() / 255.0  # Rescale to [0, 1]
+    image_tensor = torch.from_numpy(np.array(resized_image)).permute(2, 0, 1).unsqueeze(0).float() / 255.0  # Rescale to [0, 1]
     image_tensor = (image_tensor - 0.5) / 0.5  # Rescale [0, 1] to [-1, 1]
     return image_tensor
 
@@ -163,26 +238,41 @@ if __name__ == '__main__':
     generator.eval()
 
 
-    target_image = img2tensor('billie_eilish_cropped.jpg')  # Load target image (precropped 64x64)
+    target_image = img2tensor('billie_eilish_shifted.jpg')  # Load target image (precropped 64x64)
     #target_image = cropFace('dimakis-alex.jpg')
     print(target_image.shape)
     plt.imshow(tensor2numpy_image(target_image))
     plt.show()
 
-    latent_optim = LatentOptim(generator=generator, z_size=100, lr=0.1,  loss_type='lpips', device=device, target_image=target_image.to(device), logProbWeight=0)
+    latent_optim = LatentOptim(generator=generator, z_size=100, lr=0.1,  loss_type='affine(trans/scale/rot)_lpips', device=device, target_image=target_image.to(device), logProbWeight=0, shiftLossWeight=1e-2)
 
+    # Early Stopping Config
+    early_stopping = False
     min_loss = 1000000
     min_loss_iter = -1
+    best_zvec = None
+
+    print(latent_optim.dx)
+    print(latent_optim.dy)
+    # Run optimization
     for i in range(1, 10000):
         print(f"{i}: ", end="")
-        loss = latent_optim.step()
+        loss, z_vec = latent_optim.step()
         if loss < min_loss:
             min_loss = loss
             min_loss_iter = i
-        elif i - min_loss_iter >= 1000:
-            pass
+            best_zvec = z_vec
+
+        elif i - min_loss_iter >= 1000 and early_stopping:
+            break
 
     image = generator(latent_optim.z_vec).cpu().detach()
     plt.imshow(tensor2numpy_image(image))
+    plt.title(f"Last z_vec, loss{loss}")
+    plt.show()
+
+    image = generator(best_zvec).cpu().detach()
+    plt.imshow(tensor2numpy_image(image))
+    plt.title(f"Best Z_vec, loss={min_loss}, iter={min_loss_iter}")
     plt.show()
     print(torch.min(image), torch.max(image))
